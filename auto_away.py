@@ -77,8 +77,23 @@ SESSION_STRING = os.environ.get("TG_SESSION_STRING", "")
 
 AWAY_MESSAGE = os.environ.get(
     "AWAY_MESSAGE",
-    "Hi! Chalie is currently unavailable.\nሰላም! {name} ቻሌ አሁን አይገኝም። በቅርቡ ይመልስልዎታል።"
+    "Hi {name}! Chalie is currently unavailable.\nሰላም {name}! ቻሌ አሁን አይገኝም። በቅርቡ ይመልስልዎታል።"
 )
+
+
+def build_away_message(sender) -> str:
+    """Fill {name} in AWAY_MESSAGE with the sender's @username if they have one,
+    otherwise their display (first) name."""
+    if isinstance(sender, User) and sender.username:
+        name = f"@{sender.username}"
+    else:
+        name = sender_display_name(sender)
+
+    try:
+        return AWAY_MESSAGE.format(name=name)
+    except (KeyError, IndexError):
+        # AWAY_MESSAGE has no {name} placeholder (or a bad one) — send as-is
+        return AWAY_MESSAGE
 
 # --- Math calculator target ---
 MATH_CHAT_USERNAME = os.environ.get("MATH_CHAT_USERNAME", "")
@@ -89,6 +104,10 @@ FORWARD_KEYWORDS = [
     k.strip().lower() for k in os.environ.get("FORWARD_KEYWORDS", "").split(",") if k.strip()
 ]
 FORWARD_ON_MEDIA = os.environ.get("FORWARD_ON_MEDIA", "false").lower() == "true"
+# If set, EVERY message from this specific chat (username or id) is forwarded,
+# regardless of keywords/media.
+FORWARD_ALL_FROM = os.environ.get("FORWARD_ALL_FROM", "")
+forward_all_from_id = None
 
 # --- Media organizer config ---
 MEDIA_SAVE_DIR = os.environ.get("MEDIA_SAVE_DIR", "./saved_media")
@@ -222,6 +241,18 @@ async def resolve_forward_target():
         print(f"[forward] Could not resolve FORWARD_TARGET {FORWARD_TARGET}: {e}")
 
 
+async def resolve_forward_all_from():
+    global forward_all_from_id
+    if not FORWARD_ALL_FROM:
+        return
+    try:
+        entity = await client.get_entity(FORWARD_ALL_FROM)
+        forward_all_from_id = entity.id
+        print(f"[forward] Will forward EVERYTHING from: {FORWARD_ALL_FROM} → ID {forward_all_from_id}")
+    except Exception as e:
+        print(f"[forward] Could not resolve FORWARD_ALL_FROM {FORWARD_ALL_FROM}: {e}")
+
+
 def ensure_media_dir():
     if not os.path.isdir(MEDIA_SAVE_DIR):
         os.makedirs(MEDIA_SAVE_DIR, exist_ok=True)
@@ -284,7 +315,10 @@ async def message_handler(event):
     # --- Auto-forward ---
     should_forward = False
     if forward_target_entity is not None:
-        if event.message.media and FORWARD_ON_MEDIA:
+        if forward_all_from_id is not None and sender_id == forward_all_from_id:
+            # This sender is on the "forward everything" list — no other checks needed.
+            should_forward = True
+        elif event.message.media and FORWARD_ON_MEDIA:
             should_forward = True
         elif FORWARD_KEYWORDS and message_text:
             lowered = message_text.lower()
@@ -313,7 +347,7 @@ async def message_handler(event):
     if sender_id in already_replied_to:
         return
 
-    await event.reply(AWAY_MESSAGE)
+    await event.reply(build_away_message(sender))
     already_replied_to.add(sender_id)
     print(f"[auto-reply] Sent away message to {sender_id}")
 
@@ -412,6 +446,7 @@ async def main():
 
     await resolve_math_chat()
     await resolve_forward_target()
+    await resolve_forward_all_from()
 
     if DIGEST_ENABLED:
         asyncio.create_task(digest_loop())
