@@ -1,39 +1,73 @@
 """
-Telegram Personal-Account Auto-Away Responder + Math Calculator
------------------------------------------------
-Logs in as YOUR Telegram account (not a bot) using Telethon, and auto-replies
-to incoming private messages while you're in "away mode".
+Telegram Personal-Account Assistant
+------------------------------------
+Logs in as YOUR Telegram account (not a bot) using Telethon.
 
-TOGGLE AWAY MODE:
-  From ANY device, open your own "Saved Messages" chat and send:
+FEATURES:
+  1. Auto-away responder   — toggle with .away / .back in Saved Messages
+  2. Math calculator        — for one designated chat partner
+  3. Auto-forward / mirror  — forward matching messages to another chat
+  4. Media auto-organizer   — save incoming photos/docs to a local folder
+  5. Daily digest           — end-of-day summary of who messaged you, sent to Saved Messages
+
+TOGGLE AWAY MODE (send from Saved Messages, any device):
     .away    -> turns away mode ON
     .back    -> turns away mode OFF
 
 MATH CALCULATOR:
-  When your specific chat partner sends a list of calculations like:
+  When MATH_CHAT_USERNAME sends lines like:
     Sg iver = 200*85
     wound spray = 5*730
-  Your account automatically replies with results in format:
+  You get back:
     Sg iver = 200 * 85 = 17,000
     wound spray = 5 * 730 = 3,650
     Total = 20,650
 
+AUTO-FORWARD:
+  Any incoming private message that either:
+    - contains one of FORWARD_KEYWORDS (comma-separated, case-insensitive), or
+    - includes media and FORWARD_ON_MEDIA=true
+  gets forwarded as-is to FORWARD_TARGET (username, phone-linked id, or numeric chat id).
+
+MEDIA ORGANIZER:
+  Any incoming photo/document/video is downloaded to MEDIA_SAVE_DIR,
+  named "<sender>_<timestamp>.<ext>".
+
+DAILY DIGEST:
+  At DIGEST_TIME (HH:MM, local server time) each day, a summary of the day's
+  incoming private messages (sender + count) is sent to your Saved Messages,
+  then counters reset.
+
 SETUP:
   1. Get API credentials (free) at https://my.telegram.org
   2. pip install telethon python-dotenv
-  3. Create a .env file next to this script
+  3. Create a .env file next to this script (see ENV VARS below)
   4. Run: python auto_away.py
+
+ENV VARS (.env):
+  TG_API_ID=...
+  TG_API_HASH=...
+  TG_SESSION_STRING=...              (leave blank first run, script will print one)
+  AWAY_MESSAGE=...                   (optional, has a default)
+  MATH_CHAT_USERNAME=someuser        (optional, without @)
+  FORWARD_TARGET=someuser_or_id      (optional — enables forwarding)
+  FORWARD_KEYWORDS=urgent,invoice    (optional, comma-separated)
+  FORWARD_ON_MEDIA=true              (optional, default false)
+  MEDIA_SAVE_DIR=./saved_media       (optional, default ./saved_media)
+  DIGEST_ENABLED=true                (optional, default false)
+  DIGEST_TIME=20:00                  (optional, default 20:00, 24h HH:MM)
 """
 
 import os
 import re
 import asyncio
 import threading
-from datetime import datetime
+from datetime import datetime, date
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import User
 
 load_dotenv()
 
@@ -46,14 +80,32 @@ AWAY_MESSAGE = os.environ.get(
     "Hi! Chalie is currently unavailable.\nሰላም! @username ቻሌ አሁን አይገኝም። በቅርቡ ይመልስልዎታል።"
 )
 
-# --- Username of the chat partner who gets math replies ---
-# Change this to the username you want (without @)
+# --- Math calculator target ---
 MATH_CHAT_USERNAME = os.environ.get("MATH_CHAT_USERNAME", "")
+
+# --- Auto-forward config ---
+FORWARD_TARGET = os.environ.get("FORWARD_TARGET", "")
+FORWARD_KEYWORDS = [
+    k.strip().lower() for k in os.environ.get("FORWARD_KEYWORDS", "").split(",") if k.strip()
+]
+FORWARD_ON_MEDIA = os.environ.get("FORWARD_ON_MEDIA", "false").lower() == "true"
+
+# --- Media organizer config ---
+MEDIA_SAVE_DIR = os.environ.get("MEDIA_SAVE_DIR", "./saved_media")
+
+# --- Daily digest config ---
+DIGEST_ENABLED = os.environ.get("DIGEST_ENABLED", "false").lower() == "true"
+DIGEST_TIME = os.environ.get("DIGEST_TIME", "20:00")  # "HH:MM"
 
 # In-memory state
 is_away = False
 already_replied_to = set()
-math_chat_id = None  # resolved at startup
+math_chat_id = None
+forward_target_entity = None
+
+# sender_id -> {"name": str, "count": int}
+daily_stats = {}
+last_digest_date = None
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
@@ -61,13 +113,6 @@ client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 # --- Math calculator ---
 
 def parse_and_calculate(text: str):
-    """
-    Parses lines like:
-      Sg iver = 200*85
-      wound spray=5*730
-      plain: 200*85
-    Returns formatted result string or None if no math found.
-    """
     lines = text.strip().splitlines()
     results = []
     grand_total = 0
@@ -78,8 +123,6 @@ def parse_and_calculate(text: str):
         if not line:
             continue
 
-        # Match: optional label = number * number
-        # Supports: label=200*85 or label = 200*85 or just 200*85
         match = re.match(
             r'^(.*?)=?\s*(\d[\d,]*)\s*[\*x×]\s*(\d[\d,]*)\s*$',
             line,
@@ -99,7 +142,6 @@ def parse_and_calculate(text: str):
             else:
                 results.append(f"{num1:,} * {num2:,} = {result:,}")
         else:
-            # Try plain addition, subtraction, division too
             plain_match = re.match(
                 r'^(.*?)=?\s*(\d[\d,]*)\s*([+\-÷/])\s*(\d[\d,]*)\s*$',
                 line
@@ -130,7 +172,6 @@ def parse_and_calculate(text: str):
                 else:
                     results.append(f"{num1:,} {op_display} {num2:,} = {result:,}")
             else:
-                # Not a math line — include as-is so context is preserved
                 results.append(line)
 
     if not found_any:
@@ -141,7 +182,20 @@ def parse_and_calculate(text: str):
     return "\n".join(results)
 
 
-# --- Resolve math chat ID at startup ---
+# --- Helpers ---
+
+def sender_display_name(sender) -> str:
+    if isinstance(sender, User):
+        name = " ".join(filter(None, [sender.first_name, sender.last_name])).strip()
+        if not name:
+            name = sender.username or f"id{sender.id}"
+        return name
+    return getattr(sender, "title", None) or f"id{getattr(sender, 'id', 'unknown')}"
+
+
+def safe_filename_part(name: str) -> str:
+    return re.sub(r'[^a-zA-Z0-9_-]', "_", name)[:40]
+
 
 async def resolve_math_chat():
     global math_chat_id
@@ -156,11 +210,28 @@ async def resolve_math_chat():
         print(f"[math] Could not resolve username {MATH_CHAT_USERNAME}: {e}")
 
 
+async def resolve_forward_target():
+    global forward_target_entity
+    if not FORWARD_TARGET:
+        print("[forward] No FORWARD_TARGET set — auto-forward disabled.")
+        return
+    try:
+        forward_target_entity = await client.get_entity(FORWARD_TARGET)
+        print(f"[forward] Forward target resolved: {FORWARD_TARGET}")
+    except Exception as e:
+        print(f"[forward] Could not resolve FORWARD_TARGET {FORWARD_TARGET}: {e}")
+
+
+def ensure_media_dir():
+    if not os.path.isdir(MEDIA_SAVE_DIR):
+        os.makedirs(MEDIA_SAVE_DIR, exist_ok=True)
+        print(f"[media] Created media save directory: {MEDIA_SAVE_DIR}")
+
+
 # --- Handlers ---
 
 @client.on(events.NewMessage(outgoing=True, chats="me"))
 async def toggle_handler(event):
-    """Listen for commands sent to Saved Messages."""
     global is_away, already_replied_to
     text = (event.raw_text or "").strip().lower()
 
@@ -190,6 +261,43 @@ async def message_handler(event):
     sender_id = sender.id
     message_text = event.raw_text or ""
 
+    # --- Daily stats tracking ---
+    name = sender_display_name(sender)
+    entry = daily_stats.setdefault(sender_id, {"name": name, "count": 0})
+    entry["count"] += 1
+    entry["name"] = name  # keep name fresh
+
+    # --- Media organizer ---
+    if event.message.media:
+        try:
+            ensure_media_dir()
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            prefix = f"{safe_filename_part(name)}_{ts}"
+            saved_path = await client.download_media(
+                event.message, file=os.path.join(MEDIA_SAVE_DIR, prefix)
+            )
+            if saved_path:
+                print(f"[media] Saved media from {name} -> {saved_path}")
+        except Exception as e:
+            print(f"[media] Failed to save media from {name}: {e}")
+
+    # --- Auto-forward ---
+    should_forward = False
+    if forward_target_entity is not None:
+        if event.message.media and FORWARD_ON_MEDIA:
+            should_forward = True
+        elif FORWARD_KEYWORDS and message_text:
+            lowered = message_text.lower()
+            if any(kw in lowered for kw in FORWARD_KEYWORDS):
+                should_forward = True
+
+    if should_forward:
+        try:
+            await client.forward_messages(forward_target_entity, event.message)
+            print(f"[forward] Forwarded message from {name} to {FORWARD_TARGET}")
+        except Exception as e:
+            print(f"[forward] Failed to forward message from {name}: {e}")
+
     # --- Math feature: only for specific chat partner ---
     if math_chat_id and sender_id == math_chat_id:
         calc_result = parse_and_calculate(message_text)
@@ -208,6 +316,61 @@ async def message_handler(event):
     await event.reply(AWAY_MESSAGE)
     already_replied_to.add(sender_id)
     print(f"[auto-reply] Sent away message to {sender_id}")
+
+
+# --- Daily digest loop ---
+
+async def digest_loop():
+    global last_digest_date, daily_stats
+
+    if not DIGEST_ENABLED:
+        print("[digest] Daily digest disabled (DIGEST_ENABLED=false).")
+        return
+
+    try:
+        target_hour, target_minute = (int(p) for p in DIGEST_TIME.split(":"))
+    except Exception:
+        print(f"[digest] Invalid DIGEST_TIME '{DIGEST_TIME}', expected HH:MM. Digest disabled.")
+        return
+
+    print(f"[digest] Daily digest enabled, will send around {DIGEST_TIME} each day.")
+
+    while True:
+        now = datetime.now()
+        today = date.today()
+
+        if (
+            now.hour == target_hour
+            and now.minute == target_minute
+            and last_digest_date != today
+        ):
+            await send_digest()
+            last_digest_date = today
+
+        await asyncio.sleep(30)  # check twice a minute
+
+
+async def send_digest():
+    if not daily_stats:
+        summary = "📊 Daily digest: no incoming private messages today."
+    else:
+        lines = ["📊 Daily digest — incoming private messages:"]
+        total = 0
+        for stats in sorted(daily_stats.values(), key=lambda s: -s["count"]):
+            lines.append(f"  • {stats['name']}: {stats['count']}")
+            total += stats["count"]
+        lines.append("")
+        lines.append(f"Total messages: {total}")
+        lines.append(f"Unique senders: {len(daily_stats)}")
+        summary = "\n".join(lines)
+
+    try:
+        await client.send_message("me", summary)
+        print("[digest] Sent daily digest to Saved Messages")
+    except Exception as e:
+        print(f"[digest] Failed to send digest: {e}")
+
+    daily_stats.clear()
 
 
 # --- HTTP keep-alive server ---
@@ -241,7 +404,17 @@ async def main():
     print("Logged in. Listening for messages.")
     print("Send '.away' or '.back' to your Saved Messages to toggle.")
 
+    if not SESSION_STRING:
+        print("\n[!] No TG_SESSION_STRING was set. Save this string to your .env "
+              "so you don't have to log in again:\n")
+        print(client.session.save())
+        print()
+
     await resolve_math_chat()
+    await resolve_forward_target()
+
+    if DIGEST_ENABLED:
+        asyncio.create_task(digest_loop())
 
     await client.run_until_disconnected()
 
