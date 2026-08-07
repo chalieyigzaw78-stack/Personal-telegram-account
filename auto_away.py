@@ -77,7 +77,7 @@ SESSION_STRING = os.environ.get("TG_SESSION_STRING", "")
 
 AWAY_MESSAGE = os.environ.get(
     "AWAY_MESSAGE",
-    "Hi! Chalie is currently unavailable.\nሰላም! @username ቻሌ አሁን አይገኝም። በቅርቡ ይመልስልዎታል።"
+    "Hi! Chalie is currently unavailable.\nሰላም! {name} ቻሌ አሁን አይገኝም። በቅርቡ ይመልስልዎታል።"
 )
 
 # --- Math calculator target ---
