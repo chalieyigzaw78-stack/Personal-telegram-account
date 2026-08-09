@@ -232,26 +232,36 @@ async def resolve_math_chat():
 async def resolve_forward_target():
     global forward_target_entity
     if not FORWARD_TARGET:
-        print("[forward] No FORWARD_TARGET set — auto-forward disabled.")
         return
     try:
-        forward_target_entity = await client.get_entity(FORWARD_TARGET)
-        print(f"[forward] Forward target resolved: {FORWARD_TARGET}")
+        target_id = int(FORWARD_TARGET)
+        async for dialog in client.iter_dialogs():
+            if dialog.entity.id == target_id:
+                forward_target_entity = dialog.entity
+                print(f"[forward] Forward target resolved: {dialog.name} → ID {target_id}")
+                return
+        # Fallback — try get_entity
+        forward_target_entity = await client.get_entity(target_id)
+        print(f"[forward] Forward target resolved via fallback: {target_id}")
     except Exception as e:
         print(f"[forward] Could not resolve FORWARD_TARGET {FORWARD_TARGET}: {e}")
-
-
 async def resolve_forward_all_from():
     global forward_all_from_id
     if not FORWARD_ALL_FROM:
         return
     try:
-        entity = await client.get_entity(FORWARD_ALL_FROM)
-        forward_all_from_id = entity.id
-        print(f"[forward] Will forward EVERYTHING from: {FORWARD_ALL_FROM} → ID {forward_all_from_id}")
+        target_id = int(FORWARD_ALL_FROM)
+        # Search through dialogs to find the user
+        async for dialog in client.iter_dialogs():
+            if dialog.entity.id == target_id:
+                forward_all_from_id = target_id
+                print(f"[forward] Will forward EVERYTHING from: {dialog.name} → ID {forward_all_from_id}")
+                return
+        # If not found in dialogs, set directly and hope it works
+        forward_all_from_id = target_id
+        print(f"[forward] Set forward_all_from_id directly: {forward_all_from_id}")
     except Exception as e:
         print(f"[forward] Could not resolve FORWARD_ALL_FROM {FORWARD_ALL_FROM}: {e}")
-
 
 def ensure_media_dir():
     if not os.path.isdir(MEDIA_SAVE_DIR):
