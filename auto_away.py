@@ -12,10 +12,13 @@ TOGGLE AWAY MODE:
   While away mode is ON, your account is also reported to Telegram as
   OFFLINE (not just auto-replying while still showing "online"). This is
   refreshed periodically because Telegram can silently flip a connected
-  session back to "online".
+  session back to "online". Note: if you personally open Telegram on any
+  device while away mode is on, that session will show online too --
+  offline status only holds while you don't touch the app yourself.
 
 MATH CALCULATOR:
-  When your specific chat partner sends a list of calculations like:
+  Works in ANY private chat that messages you (no longer limited to one
+  specific chat). When a message contains lines like:
     Sg iver = 200*85
     wound spray = 5*730
   Your account automatically replies with results in format:
@@ -39,7 +42,6 @@ ENV VARS (.env):
   TG_API_HASH=
   TG_SESSION_STRING=
   AWAY_MESSAGE=Hi {name}! Chalie is currently unavailable.
-  MATH_CHAT_USERNAME=
   FORWARD_TARGET=
   FORWARD_ALL_FROM=id1,id2,@username3
   FORWARD_KEYWORDS=urgent,invoice
@@ -67,13 +69,11 @@ API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 SESSION_STRING = os.environ.get("TG_SESSION_STRING", "")
 
+# English only, first name is always used (no @username)
 AWAY_MESSAGE = os.environ.get(
     "AWAY_MESSAGE",
-    "Hi {name}! Chalie is currently unavailable.\nሰላም {name}! ቻሌ አሁን አይገኝም። በቅርቡ ይመልስልዎታል።"
+    "Hi {name}! Chalie is currently not active, will reply soon."
 )
-
-# --- Math calculator target ---
-MATH_CHAT_USERNAME = os.environ.get("MATH_CHAT_USERNAME", "")
 
 # --- Auto-forward config ---
 FORWARD_TARGET = os.environ.get("FORWARD_TARGET", "")
@@ -98,7 +98,6 @@ DIGEST_TIME = os.environ.get("DIGEST_TIME", "20:00")
 # In-memory state
 is_away = False
 already_replied_to = set()
-math_chat_id = None
 forward_target_entity = None
 forward_all_from_ids = set()  # set of resolved numeric IDs
 
@@ -108,7 +107,7 @@ last_digest_date = None
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 
-# --- Offline-status control (new) ---
+# --- Offline-status control ---
 
 async def set_telegram_offline(offline: bool):
     """Explicitly tell Telegram's servers our online/offline presence."""
@@ -213,8 +212,9 @@ def sender_display_name(sender) -> str:
 
 
 def build_away_message(sender) -> str:
-    if isinstance(sender, User) and sender.username:
-        name = f"@{sender.username}"
+    # Always use first name (or fallback display name) -- never @username
+    if isinstance(sender, User) and sender.first_name:
+        name = sender.first_name
     else:
         name = sender_display_name(sender)
     try:
@@ -238,19 +238,6 @@ async def resolve_from_dialogs(target_id: int):
     except Exception as e:
         print(f"[resolve] Error iterating dialogs: {e}")
     return None
-
-
-async def resolve_math_chat():
-    global math_chat_id
-    if not MATH_CHAT_USERNAME:
-        print("[math] No MATH_CHAT_USERNAME set — math feature disabled.")
-        return
-    try:
-        entity = await client.get_entity(MATH_CHAT_USERNAME)
-        math_chat_id = entity.id
-        print(f"[math] Math chat resolved: {MATH_CHAT_USERNAME} → ID {math_chat_id}")
-    except Exception as e:
-        print(f"[math] Could not resolve {MATH_CHAT_USERNAME}: {e}")
 
 
 async def resolve_forward_target():
@@ -395,13 +382,12 @@ async def message_handler(event):
         except Exception as e:
             print(f"[forward] ❌ Failed to forward from {name}: {e}")
 
-    # --- Math feature ---
-    if math_chat_id and sender_id == math_chat_id:
-        calc_result = parse_and_calculate(message_text)
-        if calc_result:
-            await event.reply(calc_result)
-            print(f"[math] Replied with calculation to {MATH_CHAT_USERNAME}")
-            return
+    # --- Math feature (works in ANY private chat) ---
+    calc_result = parse_and_calculate(message_text)
+    if calc_result:
+        await event.reply(calc_result)
+        print(f"[math] Replied with calculation to {name}")
+        return
 
     # --- Auto-away reply ---
     if not is_away:
@@ -508,7 +494,6 @@ async def main():
         print(client.session.save())
         print()
 
-    await resolve_math_chat()
     await resolve_forward_target()
     await resolve_forward_all_from()
 
