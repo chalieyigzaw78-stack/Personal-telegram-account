@@ -9,6 +9,11 @@ TOGGLE AWAY MODE:
     .away    -> turns away mode ON
     .back    -> turns away mode OFF
 
+  While away mode is ON, your account is also reported to Telegram as
+  OFFLINE (not just auto-replying while still showing "online"). This is
+  refreshed periodically because Telegram can silently flip a connected
+  session back to "online".
+
 MATH CALCULATOR:
   When your specific chat partner sends a list of calculations like:
     Sg iver = 200*85
@@ -54,6 +59,7 @@ from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import User
+from telethon.tl.functions.account import UpdateStatusRequest
 
 load_dotenv()
 
@@ -100,6 +106,29 @@ daily_stats = {}
 last_digest_date = None
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+
+
+# --- Offline-status control (new) ---
+
+async def set_telegram_offline(offline: bool):
+    """Explicitly tell Telegram's servers our online/offline presence."""
+    try:
+        await client(UpdateStatusRequest(offline=offline))
+        print(f"[presence] Set account status -> {'offline' if offline else 'online'}")
+    except Exception as e:
+        print(f"[presence] Failed to set offline={offline}: {e}")
+
+
+async def offline_keepalive_loop():
+    """
+    While away mode is on, Telegram can silently flip a connected session
+    back to 'online' (e.g. on any activity). Re-assert offline periodically
+    to keep the account showing offline for as long as away mode is active.
+    """
+    while True:
+        if is_away:
+            await set_telegram_offline(True)
+        await asyncio.sleep(30)
 
 
 # --- Math calculator ---
@@ -301,12 +330,14 @@ async def toggle_handler(event):
     if text == ".away":
         is_away = True
         already_replied_to.clear()
+        await set_telegram_offline(True)
         await event.reply(f"✅ Away mode ON ({datetime.now().strftime('%H:%M')})")
         print("[state] Away mode enabled")
 
     elif text == ".back":
         is_away = False
         already_replied_to.clear()
+        await set_telegram_offline(False)
         await event.reply(f"✅ Away mode OFF ({datetime.now().strftime('%H:%M')})")
         print("[state] Away mode disabled")
 
@@ -480,6 +511,11 @@ async def main():
     await resolve_math_chat()
     await resolve_forward_target()
     await resolve_forward_all_from()
+
+    if is_away:
+        await set_telegram_offline(True)
+
+    asyncio.create_task(offline_keepalive_loop())
 
     if DIGEST_ENABLED:
         asyncio.create_task(digest_loop())
