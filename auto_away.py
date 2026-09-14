@@ -16,6 +16,9 @@ TOGGLE AWAY MODE:
   device while away mode is on, that session will show online too --
   offline status only holds while you don't touch the app yourself.
 
+  When someone gets the auto-reply, they first receive an image
+  (AWAY_IMAGE_PATH, default ./away_robot.jpg), then the away text message.
+
 MATH CALCULATOR:
   Works in ANY private chat that messages you (no longer limited to one
   specific chat). When a message contains lines like:
@@ -42,6 +45,7 @@ ENV VARS (.env):
   TG_API_HASH=
   TG_SESSION_STRING=
   AWAY_MESSAGE=Hi {name}! Chalie is currently unavailable.
+  AWAY_IMAGE_PATH=./away_robot.jpg
   FORWARD_TARGET=
   FORWARD_ALL_FROM=id1,id2,@username3
   FORWARD_KEYWORDS=urgent,invoice
@@ -74,6 +78,9 @@ AWAY_MESSAGE = os.environ.get(
     "AWAY_MESSAGE",
     "Hi {name}! Chalie is currently not active, will reply soon."
 )
+
+# Image sent before the away text reply
+AWAY_IMAGE_PATH = os.environ.get("AWAY_IMAGE_PATH", "./away_robot.jpg")
 
 # --- Auto-forward config ---
 FORWARD_TARGET = os.environ.get("FORWARD_TARGET", "")
@@ -395,9 +402,18 @@ async def message_handler(event):
     if sender_id in already_replied_to:
         return
 
+    # Send the robot image first, then the away text
+    if AWAY_IMAGE_PATH and os.path.exists(AWAY_IMAGE_PATH):
+        try:
+            await client.send_file(sender_id, AWAY_IMAGE_PATH)
+        except Exception as e:
+            print(f"[auto-reply] Failed to send away image to {name}: {e}")
+    else:
+        print(f"[auto-reply] AWAY_IMAGE_PATH not found ({AWAY_IMAGE_PATH}), skipping image.")
+
     await event.reply(build_away_message(sender))
     already_replied_to.add(sender_id)
-    print(f"[auto-reply] Sent away message to {name}")
+    print(f"[auto-reply] Sent away image + message to {name}")
 
 
 # --- Daily digest loop ---
