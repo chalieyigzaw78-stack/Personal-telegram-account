@@ -37,7 +37,7 @@ import threading
 from datetime import datetime, date
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
 from telethon.tl.types import User
 from telethon.tl.functions.account import UpdateStatusRequest
@@ -81,7 +81,7 @@ is_away = False
 already_replied_to = set()
 forward_target_entity = None
 forward_all_from_ids = set()
-group_source_id = None
+group_source_id = None       # normalized "marked" chat id, matches event.chat_id
 group_target_entity = None
 daily_stats = {}
 last_digest_date = None
@@ -199,13 +199,53 @@ def safe_filename_part(name: str) -> str:
 # --- Resolve helpers ---
 
 async def resolve_from_dialogs(target_id: int):
+    """
+    Search dialogs for a match by either the bare entity id OR the
+    normalized 'marked' peer id (the form Telethon uses for event.chat_id,
+    e.g. -100xxxxxxxxxx for supergroups/channels). Handles both so callers
+    can pass whichever ID format they have.
+    """
     try:
         async for dialog in client.iter_dialogs():
-            if dialog.entity.id == target_id:
+            if dialog.entity.id == target_id or utils.get_peer_id(dialog.entity) == target_id:
                 return dialog.entity
     except Exception as e:
         print(f"[resolve] Error: {e}")
     return None
+
+
+async def resolve_any_chat(value: str):
+    """
+    Resolve a username or numeric ID (bare or marked/-100 form) to an
+    entity, trying dialogs first, then get_entity, then stripping a
+    -100 supergroup/channel prefix as a last resort.
+    """
+    value = value.strip()
+    if not value:
+        raise ValueError("empty value")
+
+    if value.lstrip("-").isdigit():
+        raw_id = int(value)
+
+        found = await resolve_from_dialogs(raw_id)
+        if found:
+            return found
+
+        try:
+            return await client.get_entity(raw_id)
+        except Exception:
+            pass
+
+        if str(raw_id).startswith("-100"):
+            try:
+                bare_id = int(str(raw_id)[4:])
+                return await client.get_entity(bare_id)
+            except Exception:
+                pass
+
+        raise ValueError(f"could not resolve ID {raw_id} (not in dialogs, not directly resolvable)")
+
+    return await client.get_entity(value)
 
 
 async def resolve_forward_target():
@@ -214,20 +254,8 @@ async def resolve_forward_target():
         print("[forward] No FORWARD_TARGET set.")
         return
     try:
-        target_id = int(FORWARD_TARGET)
-        entity = await resolve_from_dialogs(target_id)
-        if entity:
-            forward_target_entity = entity
-            print(f"[forward] Target resolved: {sender_display_name(entity)}")
-            return
-        forward_target_entity = await client.get_entity(target_id)
-        print(f"[forward] Target resolved: {target_id}")
-    except ValueError:
-        try:
-            forward_target_entity = await client.get_entity(FORWARD_TARGET)
-            print(f"[forward] Target resolved: {FORWARD_TARGET}")
-        except Exception as e:
-            print(f"[forward] Could not resolve FORWARD_TARGET: {e}")
+        forward_target_entity = await resolve_any_chat(FORWARD_TARGET)
+        print(f"[forward] Target resolved: {sender_display_name(forward_target_entity)}")
     except Exception as e:
         print(f"[forward] Could not resolve FORWARD_TARGET: {e}")
 
@@ -256,35 +284,26 @@ async def resolve_forward_all_from():
 
 
 async def resolve_group_mirror():
+    """
+    Resolves GROUP_SOURCE / GROUP_TARGET and stores group_source_id as the
+    normalized 'marked' peer id, so it can be compared directly against
+    event.chat_id in the handler (fixes supergroup/channel ID mismatch).
+    """
     global group_source_id, group_target_entity
     if not GROUP_SOURCE or not GROUP_TARGET:
         print("[mirror] GROUP_SOURCE or GROUP_TARGET not set — mirror disabled.")
         return
-    # Resolve source
+
     try:
-        if GROUP_SOURCE.lstrip("-").isdigit():
-            src_id = int(GROUP_SOURCE)
-            entity = await resolve_from_dialogs(src_id)
-            if not entity:
-                entity = await client.get_entity(src_id)
-            group_source_id = entity.id
-        else:
-            entity = await client.get_entity(GROUP_SOURCE)
-            group_source_id = entity.id
-        print(f"[mirror] ✅ Source: {getattr(entity, 'title', GROUP_SOURCE)} → ID {group_source_id}")
+        source_entity = await resolve_any_chat(GROUP_SOURCE)
+        group_source_id = utils.get_peer_id(source_entity)
+        print(f"[mirror] ✅ Source: {getattr(source_entity, 'title', GROUP_SOURCE)} → chat_id {group_source_id}")
     except Exception as e:
         print(f"[mirror] ❌ Could not resolve GROUP_SOURCE: {e}")
         return
-    # Resolve target
+
     try:
-        if GROUP_TARGET.lstrip("-").isdigit():
-            tgt_id = int(GROUP_TARGET)
-            entity = await resolve_from_dialogs(tgt_id)
-            if not entity:
-                entity = await client.get_entity(tgt_id)
-            group_target_entity = entity
-        else:
-            group_target_entity = await client.get_entity(GROUP_TARGET)
+        group_target_entity = await resolve_any_chat(GROUP_TARGET)
         print(f"[mirror] ✅ Target: {getattr(group_target_entity, 'title', GROUP_TARGET)}")
     except Exception as e:
         print(f"[mirror] ❌ Could not resolve GROUP_TARGET: {e}")
@@ -317,8 +336,7 @@ async def message_handler(event):
     # ── GROUP MIRROR ──────────────────────────────────────────────────────
     if not event.is_private:
         if group_source_id and group_target_entity:
-            chat_id = event.chat_id
-            if abs(chat_id) == abs(group_source_id):
+            if event.chat_id == group_source_id:
                 try:
                     await client.forward_messages(group_target_entity, event.message)
                     print(f"[mirror] ✅ Forwarded group message to target")
