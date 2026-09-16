@@ -7,8 +7,8 @@ FEATURES:
   - Away mode (toggle with .away / .back in Saved Messages)
   - Robot image sent before away text reply
   - Math calculator (any private chat)
-  - Auto-forward from specific private chats
-  - Group mirror: forward EVERYTHING from one group to another
+  - Auto-forward from specific private chats (no "Forwarded from" label)
+  - Group mirror: forward EVERYTHING from one group to another (no "Forwarded from" label)
   - Media auto-save
   - Daily digest
   - Offline status when away
@@ -39,7 +39,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
-from telethon.tl.types import User
+from telethon.tl.types import User, MessageMediaPhoto, MessageMediaDocument
 from telethon.tl.functions.account import UpdateStatusRequest
 
 load_dotenv()
@@ -81,12 +81,36 @@ is_away = False
 already_replied_to = set()
 forward_target_entity = None
 forward_all_from_ids = set()
-group_source_id = None       # normalized "marked" chat id, matches event.chat_id
+group_source_id = None
 group_target_entity = None
 daily_stats = {}
 last_digest_date = None
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+
+
+# --- Copy message without "Forwarded from" label ---
+
+async def copy_message(target_entity, message):
+    """
+    Send message content to target WITHOUT the 'Forwarded from' label.
+    Handles text, photos, documents, videos, stickers, voice notes, etc.
+    """
+    try:
+        text = message.message or ""
+        if message.media:
+            # Download media to memory and resend it
+            await client.send_file(
+                target_entity,
+                file=message.media,
+                caption=text or None,
+            )
+        elif text:
+            await client.send_message(target_entity, text)
+    except Exception as e:
+        # Fallback: if copy fails, try regular forward
+        print(f"[copy] Copy failed ({e}), falling back to forward")
+        await client.forward_messages(target_entity, message)
 
 
 # --- Offline-status control ---
@@ -199,12 +223,6 @@ def safe_filename_part(name: str) -> str:
 # --- Resolve helpers ---
 
 async def resolve_from_dialogs(target_id: int):
-    """
-    Search dialogs for a match by either the bare entity id OR the
-    normalized 'marked' peer id (the form Telethon uses for event.chat_id,
-    e.g. -100xxxxxxxxxx for supergroups/channels). Handles both so callers
-    can pass whichever ID format they have.
-    """
     try:
         async for dialog in client.iter_dialogs():
             if dialog.entity.id == target_id or utils.get_peer_id(dialog.entity) == target_id:
@@ -215,35 +233,26 @@ async def resolve_from_dialogs(target_id: int):
 
 
 async def resolve_any_chat(value: str):
-    """
-    Resolve a username or numeric ID (bare or marked/-100 form) to an
-    entity, trying dialogs first, then get_entity, then stripping a
-    -100 supergroup/channel prefix as a last resort.
-    """
     value = value.strip()
     if not value:
         raise ValueError("empty value")
 
     if value.lstrip("-").isdigit():
         raw_id = int(value)
-
         found = await resolve_from_dialogs(raw_id)
         if found:
             return found
-
         try:
             return await client.get_entity(raw_id)
         except Exception:
             pass
-
         if str(raw_id).startswith("-100"):
             try:
                 bare_id = int(str(raw_id)[4:])
                 return await client.get_entity(bare_id)
             except Exception:
                 pass
-
-        raise ValueError(f"could not resolve ID {raw_id} (not in dialogs, not directly resolvable)")
+        raise ValueError(f"could not resolve ID {raw_id}")
 
     return await client.get_entity(value)
 
@@ -284,16 +293,10 @@ async def resolve_forward_all_from():
 
 
 async def resolve_group_mirror():
-    """
-    Resolves GROUP_SOURCE / GROUP_TARGET and stores group_source_id as the
-    normalized 'marked' peer id, so it can be compared directly against
-    event.chat_id in the handler (fixes supergroup/channel ID mismatch).
-    """
     global group_source_id, group_target_entity
     if not GROUP_SOURCE or not GROUP_TARGET:
         print("[mirror] GROUP_SOURCE or GROUP_TARGET not set — mirror disabled.")
         return
-
     try:
         source_entity = await resolve_any_chat(GROUP_SOURCE)
         group_source_id = utils.get_peer_id(source_entity)
@@ -301,7 +304,6 @@ async def resolve_group_mirror():
     except Exception as e:
         print(f"[mirror] ❌ Could not resolve GROUP_SOURCE: {e}")
         return
-
     try:
         group_target_entity = await resolve_any_chat(GROUP_TARGET)
         print(f"[mirror] ✅ Target: {getattr(group_target_entity, 'title', GROUP_TARGET)}")
@@ -338,8 +340,8 @@ async def message_handler(event):
         if group_source_id and group_target_entity:
             if event.chat_id == group_source_id:
                 try:
-                    await client.forward_messages(group_target_entity, event.message)
-                    print(f"[mirror] ✅ Forwarded group message to target")
+                    await copy_message(group_target_entity, event.message)
+                    print(f"[mirror] ✅ Copied group message to target (no source label)")
                 except Exception as e:
                     print(f"[mirror] ❌ Failed: {e}")
         return
@@ -372,7 +374,7 @@ async def message_handler(event):
         except Exception as e:
             print(f"[media] Failed to save media from {name}: {e}")
 
-    # Auto-forward
+    # Auto-forward (no source label)
     should_forward = False
     if forward_target_entity is not None:
         if forward_all_from_ids and sender_id in forward_all_from_ids:
@@ -386,8 +388,8 @@ async def message_handler(event):
 
     if should_forward:
         try:
-            await client.forward_messages(forward_target_entity, event.message)
-            print(f"[forward] ✅ Forwarded from {name}")
+            await copy_message(forward_target_entity, event.message)
+            print(f"[forward] ✅ Copied from {name} (no source label)")
         except Exception as e:
             print(f"[forward] ❌ Failed: {e}")
 
