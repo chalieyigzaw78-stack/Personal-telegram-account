@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
-from telethon.tl.types import User
+from telethon.tl.types import User, MessageMediaWebPage
 from telethon.tl.functions.account import UpdateStatusRequest
 
 load_dotenv()
@@ -108,29 +108,41 @@ async def copy_message(target_entity, message, source_entity=None):
 
     If source_entity and target_entity both have a @username, any mention
     of the source's @username inside the message text/caption is replaced
-    with the target's @username (e.g. a channel's own promotional footer
-    tag gets swapped to point at your channel instead of theirs).
+    with the target's @username.
+
+    IMPORTANT: this never falls back to a real forward. A real forward
+    (client.forward_messages) always carries a "Forwarded from" label,
+    which is exactly what this function exists to avoid. If a message's
+    media can't be cleanly copied (e.g. link previews, polls, contacts —
+    none of which are real uploadable files), the text is sent on its own
+    and the media is skipped, rather than leaking the original source.
     """
-    try:
-        text = message.message or ""
+    text = message.message or ""
 
-        source_username = getattr(source_entity, "username", None)
-        target_username = getattr(target_entity, "username", None)
-        if text and source_username and target_username:
-            pattern = re.compile(re.escape(f"@{source_username}"), re.IGNORECASE)
-            text = pattern.sub(f"@{target_username}", text)
+    source_username = getattr(source_entity, "username", None)
+    target_username = getattr(target_entity, "username", None)
+    if text and source_username and target_username:
+        pattern = re.compile(re.escape(f"@{source_username}"), re.IGNORECASE)
+        text = pattern.sub(f"@{target_username}", text)
 
-        if message.media:
-            await client.send_file(
-                target_entity,
-                file=message.media,
-                caption=text or None,
-            )
-        elif text:
+    media = message.media
+
+    # Link previews aren't real files -- sending the URL as plain text lets
+    # Telegram regenerate its own preview automatically on the target side.
+    if media is None or isinstance(media, MessageMediaWebPage):
+        if text:
             await client.send_message(target_entity, text)
+        return
+
+    try:
+        await client.send_file(target_entity, file=media, caption=text or None)
     except Exception as e:
-        print(f"[copy] Copy failed ({e}), falling back to forward")
-        await client.forward_messages(target_entity, message)
+        print(f"[copy] Could not copy this media type ({e}); sending text only, skipping media.")
+        if text:
+            try:
+                await client.send_message(target_entity, text)
+            except Exception as e2:
+                print(f"[copy] Also failed to send text fallback: {e2}")
 
 
 # --- Offline-status control ---
