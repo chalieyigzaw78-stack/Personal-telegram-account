@@ -8,7 +8,11 @@ FEATURES:
   - Robot image sent before away text reply
   - Math calculator (any private chat)
   - Auto-forward from specific private chats (no "Forwarded from" label)
-  - Group mirror: forward EVERYTHING from one group to another (no "Forwarded from" label)
+  - Group mirror: forward EVERYTHING from one or more groups to matching
+    targets (no "Forwarded from" label), with any leftover @channelusername
+    mention in the copied text replaced by your own target channel's
+    username (e.g. if the source channel signs its posts with
+    "@originalchannel", your mirrored copy shows "@yourchannel" instead)
   - Media auto-save
   - Daily digest
   - Offline status when away
@@ -26,8 +30,12 @@ ENV VARS:
   MEDIA_SAVE_DIR=./saved_media
   DIGEST_ENABLED=true
   DIGEST_TIME=20:00
-  GROUP_SOURCE=  (group username or ID to mirror FROM)
-  GROUP_TARGET=  (group username or ID to mirror TO)
+
+  # Multiple mirror pairs supported: comma-separated, matched by position.
+  # GROUP_SOURCE's 1st entry mirrors to GROUP_TARGET's 1st entry, and so on.
+  # Each entry can be a group/channel username or numeric ID.
+  GROUP_SOURCE=@channelA,@channelB,-1001234567890
+  GROUP_TARGET=@mychannelA,@mychannelB,@mychannelC
 """
 
 import os
@@ -39,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
-from telethon.tl.types import User, MessageMediaPhoto, MessageMediaDocument
+from telethon.tl.types import User
 from telethon.tl.functions.account import UpdateStatusRequest
 
 load_dotenv()
@@ -65,7 +73,7 @@ FORWARD_ALL_FROM_RAW = [
     x.strip() for x in os.environ.get("FORWARD_ALL_FROM", "").split(",") if x.strip()
 ]
 
-# --- Group mirror config ---
+# --- Group mirror config (comma-separated, paired by position) ---
 GROUP_SOURCE = os.environ.get("GROUP_SOURCE", "")
 GROUP_TARGET = os.environ.get("GROUP_TARGET", "")
 
@@ -81,25 +89,38 @@ is_away = False
 already_replied_to = set()
 forward_target_entity = None
 forward_all_from_ids = set()
-group_source_id = None
-group_target_entity = None
+
+# List of dicts: {"source_id": <marked chat id>, "source_entity": ..., "target_entity": ...}
+mirror_pairs = []
+
 daily_stats = {}
 last_digest_date = None
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 
-# --- Copy message without "Forwarded from" label ---
+# --- Copy message without "Forwarded from" label, with username swap ---
 
-async def copy_message(target_entity, message):
+async def copy_message(target_entity, message, source_entity=None):
     """
     Send message content to target WITHOUT the 'Forwarded from' label.
     Handles text, photos, documents, videos, stickers, voice notes, etc.
+
+    If source_entity and target_entity both have a @username, any mention
+    of the source's @username inside the message text/caption is replaced
+    with the target's @username (e.g. a channel's own promotional footer
+    tag gets swapped to point at your channel instead of theirs).
     """
     try:
         text = message.message or ""
+
+        source_username = getattr(source_entity, "username", None)
+        target_username = getattr(target_entity, "username", None)
+        if text and source_username and target_username:
+            pattern = re.compile(re.escape(f"@{source_username}"), re.IGNORECASE)
+            text = pattern.sub(f"@{target_username}", text)
+
         if message.media:
-            # Download media to memory and resend it
             await client.send_file(
                 target_entity,
                 file=message.media,
@@ -108,7 +129,6 @@ async def copy_message(target_entity, message):
         elif text:
             await client.send_message(target_entity, text)
     except Exception as e:
-        # Fallback: if copy fails, try regular forward
         print(f"[copy] Copy failed ({e}), falling back to forward")
         await client.forward_messages(target_entity, message)
 
@@ -292,23 +312,52 @@ async def resolve_forward_all_from():
     print(f"[forward] Active IDs: {forward_all_from_ids}")
 
 
-async def resolve_group_mirror():
-    global group_source_id, group_target_entity
-    if not GROUP_SOURCE or not GROUP_TARGET:
+async def resolve_group_mirrors():
+    """
+    Resolves GROUP_SOURCE / GROUP_TARGET as comma-separated lists, paired by
+    position, into `mirror_pairs`. Each pair's source_id is the normalized
+    'marked' peer id so it can be compared directly against event.chat_id.
+    """
+    global mirror_pairs
+    sources = [s.strip() for s in GROUP_SOURCE.split(",") if s.strip()]
+    targets = [t.strip() for t in GROUP_TARGET.split(",") if t.strip()]
+
+    if not sources or not targets:
         print("[mirror] GROUP_SOURCE or GROUP_TARGET not set — mirror disabled.")
         return
-    try:
-        source_entity = await resolve_any_chat(GROUP_SOURCE)
-        group_source_id = utils.get_peer_id(source_entity)
-        print(f"[mirror] ✅ Source: {getattr(source_entity, 'title', GROUP_SOURCE)} → chat_id {group_source_id}")
-    except Exception as e:
-        print(f"[mirror] ❌ Could not resolve GROUP_SOURCE: {e}")
-        return
-    try:
-        group_target_entity = await resolve_any_chat(GROUP_TARGET)
-        print(f"[mirror] ✅ Target: {getattr(group_target_entity, 'title', GROUP_TARGET)}")
-    except Exception as e:
-        print(f"[mirror] ❌ Could not resolve GROUP_TARGET: {e}")
+
+    if len(sources) != len(targets):
+        print(
+            f"[mirror] ⚠️ GROUP_SOURCE has {len(sources)} entries but GROUP_TARGET has "
+            f"{len(targets)}. Pairing by position up to the shorter list; extra entries ignored."
+        )
+
+    for src_val, tgt_val in zip(sources, targets):
+        try:
+            source_entity = await resolve_any_chat(src_val)
+            source_id = utils.get_peer_id(source_entity)
+        except Exception as e:
+            print(f"[mirror] ❌ Could not resolve source '{src_val}': {e}")
+            continue
+
+        try:
+            target_entity = await resolve_any_chat(tgt_val)
+        except Exception as e:
+            print(f"[mirror] ❌ Could not resolve target '{tgt_val}': {e}")
+            continue
+
+        mirror_pairs.append({
+            "source_id": source_id,
+            "source_entity": source_entity,
+            "target_entity": target_entity,
+        })
+        print(
+            f"[mirror] ✅ {getattr(source_entity, 'title', src_val)} → "
+            f"{getattr(target_entity, 'title', tgt_val)} (chat_id {source_id})"
+        )
+
+    if not mirror_pairs:
+        print("[mirror] No valid mirror pairs configured.")
 
 
 # --- Handlers ---
@@ -335,15 +384,18 @@ async def toggle_handler(event):
 async def message_handler(event):
     """Handle ALL incoming messages — private and group."""
 
-    # ── GROUP MIRROR ──────────────────────────────────────────────────────
+    # ── GROUP MIRROR (supports multiple source → target pairs) ─────────────
     if not event.is_private:
-        if group_source_id and group_target_entity:
-            if event.chat_id == group_source_id:
+        for pair in mirror_pairs:
+            if event.chat_id == pair["source_id"]:
                 try:
-                    await copy_message(group_target_entity, event.message)
-                    print(f"[mirror] ✅ Copied group message to target (no source label)")
+                    await copy_message(
+                        pair["target_entity"], event.message, source_entity=pair["source_entity"]
+                    )
+                    print(f"[mirror] ✅ Copied message from chat_id {pair['source_id']} to target")
                 except Exception as e:
                     print(f"[mirror] ❌ Failed: {e}")
+                break
         return
 
     # ── PRIVATE CHAT ──────────────────────────────────────────────────────
@@ -472,7 +524,10 @@ class PingHandler(BaseHTTPRequestHandler):
         self.end_headers()
         status = "AWAY" if is_away else "ACTIVE"
         fwd_ids = ",".join(str(i) for i in forward_all_from_ids) or "none"
-        mirror = f"{group_source_id}→{getattr(group_target_entity,'id','?')}" if group_source_id else "disabled"
+        mirror = (
+            ", ".join(f"{p['source_id']}→{getattr(p['target_entity'], 'id', '?')}" for p in mirror_pairs)
+            or "disabled"
+        )
         self.wfile.write(
             f"OK - status: {status} - forward_all_from: {fwd_ids} - mirror: {mirror}".encode()
         )
@@ -504,7 +559,7 @@ async def main():
 
     await resolve_forward_target()
     await resolve_forward_all_from()
-    await resolve_group_mirror()
+    await resolve_group_mirrors()
 
     if is_away:
         await set_telegram_offline(True)
