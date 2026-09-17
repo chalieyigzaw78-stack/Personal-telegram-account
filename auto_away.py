@@ -12,7 +12,10 @@ FEATURES:
     targets (no "Forwarded from" label), with any leftover @channelusername
     mention in the copied text replaced by your own target channel's
     username (e.g. if the source channel signs its posts with
-    "@originalchannel", your mirrored copy shows "@yourchannel" instead)
+    "@originalchannel", your mirrored copy shows "@yourchannel" instead).
+    Supports many-to-one (several sources -> one shared target) and
+    photo/video ALBUMS are reassembled and copied as a single grouped
+    album, not as separate individual posts.
   - Media auto-save
   - Daily digest
   - Offline status when away
@@ -31,11 +34,23 @@ ENV VARS:
   DIGEST_ENABLED=true
   DIGEST_TIME=20:00
 
-  # Multiple mirror pairs supported: comma-separated, matched by position.
-  # GROUP_SOURCE's 1st entry mirrors to GROUP_TARGET's 1st entry, and so on.
+  # Multiple mirror pairs, comma-separated:
+  #
+  # 1) One-to-one / many-to-many, matched by position:
+  #      GROUP_SOURCE=@channelA,@channelB,-1001234567890
+  #      GROUP_TARGET=@mychannelA,@mychannelB,@mychannelC
+  #
+  # 2) Many-to-one: list a SINGLE target and multiple sources -- every
+  #    source automatically mirrors into that one shared target:
+  #      GROUP_SOURCE=@channelA,@channelB,@channelC
+  #      GROUP_TARGET=@myaggregatorchannel
+  #
+  # 3) One-to-many: list a SINGLE source and multiple targets -- that one
+  #    source mirrors into every listed target:
+  #      GROUP_SOURCE=@channelA
+  #      GROUP_TARGET=@mychannelA,@mychannelB
+  #
   # Each entry can be a group/channel username or numeric ID.
-  GROUP_SOURCE=@channelA,@channelB,-1001234567890
-  GROUP_TARGET=@mychannelA,@mychannelB,@mychannelC
 """
 
 import os
@@ -93,6 +108,14 @@ forward_all_from_ids = set()
 # List of dicts: {"source_id": <marked chat id>, "source_entity": ..., "target_entity": ...}
 mirror_pairs = []
 
+# Album buffering: Telegram delivers each photo/video in an album as a
+# SEPARATE event sharing the same grouped_id. We buffer them briefly and
+# flush as one combined album once no new part has arrived for a short
+# debounce window, rather than copying each photo as its own post.
+# Key: (source_chat_id, grouped_id) -> {"messages": [...], "pairs": [...], "timer": asyncio.Task}
+album_buffers = {}
+ALBUM_DEBOUNCE_SECONDS = 1.5
+
 daily_stats = {}
 last_digest_date = None
 
@@ -101,14 +124,46 @@ client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 # --- Copy message without "Forwarded from" label, with username swap ---
 
+def apply_username_swap(text: str, source_entity, target_entity) -> str:
+    """
+    Replaces any mention of the source channel's identity with the target's,
+    catching both forms people use to reference a channel:
+      - @username mentions
+      - t.me/username or https://t.me/username links (with/without www.)
+    Only runs if BOTH entities have a public username set.
+    """
+    if not text:
+        return text
+
+    source_username = getattr(source_entity, "username", None)
+    target_username = getattr(target_entity, "username", None)
+    if not source_username or not target_username:
+        return text
+
+    at_pattern = re.compile(rf'@{re.escape(source_username)}\b', re.IGNORECASE)
+    text = at_pattern.sub(f'@{target_username}', text)
+
+    link_pattern = re.compile(
+        rf'(https?://)?(www\.)?t\.me/{re.escape(source_username)}\b',
+        re.IGNORECASE
+    )
+
+    def link_sub(m):
+        prefix = (m.group(1) or "") + (m.group(2) or "")
+        return f"{prefix}t.me/{target_username}"
+
+    text = link_pattern.sub(link_sub, text)
+    return text
+
+
 async def copy_message(target_entity, message, source_entity=None):
     """
     Send message content to target WITHOUT the 'Forwarded from' label.
     Handles text, photos, documents, videos, stickers, voice notes, etc.
 
     If source_entity and target_entity both have a @username, any mention
-    of the source's @username inside the message text/caption is replaced
-    with the target's @username.
+    of the source's @username OR t.me/username link inside the message
+    text/caption is replaced with the target's equivalent.
 
     IMPORTANT: this never falls back to a real forward. A real forward
     (client.forward_messages) always carries a "Forwarded from" label,
@@ -118,12 +173,7 @@ async def copy_message(target_entity, message, source_entity=None):
     and the media is skipped, rather than leaking the original source.
     """
     text = message.message or ""
-
-    source_username = getattr(source_entity, "username", None)
-    target_username = getattr(target_entity, "username", None)
-    if text and source_username and target_username:
-        pattern = re.compile(re.escape(f"@{source_username}"), re.IGNORECASE)
-        text = pattern.sub(f"@{target_username}", text)
+    text = apply_username_swap(text, source_entity, target_entity)
 
     media = message.media
 
@@ -143,6 +193,56 @@ async def copy_message(target_entity, message, source_entity=None):
                 await client.send_message(target_entity, text)
             except Exception as e2:
                 print(f"[copy] Also failed to send text fallback: {e2}")
+
+
+async def flush_album(key):
+    """
+    Sends every buffered part of an album as ONE grouped album to each
+    matching target, instead of as separate individual posts.
+    """
+    entry = album_buffers.pop(key, None)
+    if not entry:
+        return
+
+    messages = sorted(entry["messages"], key=lambda m: m.id)
+    media_list = [m.media for m in messages if m.media]
+    if not media_list:
+        return
+
+    # Telegram albums usually carry the caption on only one of the parts.
+    caption_text = ""
+    for m in messages:
+        if m.message:
+            caption_text = m.message
+            break
+
+    for pair in entry["pairs"]:
+        target_entity = pair["target_entity"]
+        source_entity = pair["source_entity"]
+        text = apply_username_swap(caption_text, source_entity, target_entity)
+
+        try:
+            await client.send_file(target_entity, file=media_list, caption=text or None)
+            print(f"[mirror] ✅ Copied album of {len(media_list)} items to target")
+        except Exception as e:
+            # If the album itself can't be sent as a group for some reason,
+            # fall back to copying each item individually (still unlabeled,
+            # never a real forward) rather than losing the content.
+            print(f"[mirror] ⚠️ Album copy failed ({e}); sending items individually instead.")
+            for m in messages:
+                try:
+                    await copy_message(target_entity, m, source_entity=source_entity)
+                except Exception as e2:
+                    print(f"[mirror] ❌ Individual fallback failed: {e2}")
+
+
+async def schedule_album_flush(key):
+    """Debounce timer: flush only after no new part has arrived for a bit."""
+    try:
+        await asyncio.sleep(ALBUM_DEBOUNCE_SECONDS)
+        await flush_album(key)
+    except asyncio.CancelledError:
+        pass  # a newer part arrived and reset the timer -- this one is stale
 
 
 # --- Offline-status control ---
@@ -326,9 +426,16 @@ async def resolve_forward_all_from():
 
 async def resolve_group_mirrors():
     """
-    Resolves GROUP_SOURCE / GROUP_TARGET as comma-separated lists, paired by
-    position, into `mirror_pairs`. Each pair's source_id is the normalized
-    'marked' peer id so it can be compared directly against event.chat_id.
+    Resolves GROUP_SOURCE / GROUP_TARGET into `mirror_pairs`.
+
+    - Equal-length lists: paired by position (1st source -> 1st target, etc.)
+    - Single target, multiple sources: many-to-one -- every source mirrors
+      into that one shared target.
+    - Single source, multiple targets: one-to-many -- that source mirrors
+      into every listed target.
+
+    Each pair's source_id is the normalized 'marked' peer id so it can be
+    compared directly against event.chat_id.
     """
     global mirror_pairs
     sources = [s.strip() for s in GROUP_SOURCE.split(",") if s.strip()]
@@ -338,22 +445,37 @@ async def resolve_group_mirrors():
         print("[mirror] GROUP_SOURCE or GROUP_TARGET not set — mirror disabled.")
         return
 
-    if len(sources) != len(targets):
+    if len(targets) == 1 and len(sources) > 1:
+        print(f"[mirror] Many-to-one mode: all {len(sources)} sources will mirror into '{targets[0]}'.")
+        targets = targets * len(sources)
+    elif len(sources) == 1 and len(targets) > 1:
+        print(f"[mirror] One-to-many mode: '{sources[0]}' will mirror into all {len(targets)} targets.")
+        sources = sources * len(targets)
+    elif len(sources) != len(targets):
         print(
             f"[mirror] ⚠️ GROUP_SOURCE has {len(sources)} entries but GROUP_TARGET has "
             f"{len(targets)}. Pairing by position up to the shorter list; extra entries ignored."
         )
 
+    # Cache resolved entities so the same source/target isn't re-resolved
+    # repeatedly in many-to-one / one-to-many setups.
+    resolved_cache = {}
+
+    async def resolve_cached(value):
+        if value not in resolved_cache:
+            resolved_cache[value] = await resolve_any_chat(value)
+        return resolved_cache[value]
+
     for src_val, tgt_val in zip(sources, targets):
         try:
-            source_entity = await resolve_any_chat(src_val)
+            source_entity = await resolve_cached(src_val)
             source_id = utils.get_peer_id(source_entity)
         except Exception as e:
             print(f"[mirror] ❌ Could not resolve source '{src_val}': {e}")
             continue
 
         try:
-            target_entity = await resolve_any_chat(tgt_val)
+            target_entity = await resolve_cached(tgt_val)
         except Exception as e:
             print(f"[mirror] ❌ Could not resolve target '{tgt_val}': {e}")
             continue
@@ -396,18 +518,36 @@ async def toggle_handler(event):
 async def message_handler(event):
     """Handle ALL incoming messages — private and group."""
 
-    # ── GROUP MIRROR (supports multiple source → target pairs) ─────────────
+    # ── GROUP MIRROR (supports many-to-one, one-to-many, and albums) ───────
     if not event.is_private:
-        for pair in mirror_pairs:
-            if event.chat_id == pair["source_id"]:
-                try:
-                    await copy_message(
-                        pair["target_entity"], event.message, source_entity=pair["source_entity"]
-                    )
-                    print(f"[mirror] ✅ Copied message from chat_id {pair['source_id']} to target")
-                except Exception as e:
-                    print(f"[mirror] ❌ Failed: {e}")
-                break
+        chat_id = event.chat_id
+        matching_pairs = [p for p in mirror_pairs if p["source_id"] == chat_id]
+        if not matching_pairs:
+            return
+
+        grouped_id = getattr(event.message, "grouped_id", None)
+
+        if grouped_id:
+            # Part of an album -- buffer it and (re)start the debounce timer
+            key = (chat_id, grouped_id)
+            if key not in album_buffers:
+                album_buffers[key] = {"messages": [], "pairs": matching_pairs, "timer": None}
+            album_buffers[key]["messages"].append(event.message)
+
+            old_timer = album_buffers[key].get("timer")
+            if old_timer:
+                old_timer.cancel()
+            album_buffers[key]["timer"] = asyncio.create_task(schedule_album_flush(key))
+            return
+
+        for pair in matching_pairs:
+            try:
+                await copy_message(
+                    pair["target_entity"], event.message, source_entity=pair["source_entity"]
+                )
+                print(f"[mirror] ✅ Copied message from chat_id {chat_id} to target")
+            except Exception as e:
+                print(f"[mirror] ❌ Failed: {e}")
         return
 
     # ── PRIVATE CHAT ──────────────────────────────────────────────────────
