@@ -34,23 +34,26 @@ ENV VARS:
   DIGEST_ENABLED=true
   DIGEST_TIME=20:00
 
-  # Multiple mirror pairs, comma-separated:
+  # Multiple mirror pairs. Both options below can be used AT THE SAME TIME
+  # -- their pairs are merged together, not one overriding the other.
   #
-  # 1) One-to-one / many-to-many, matched by position:
-  #      GROUP_SOURCE=@channelA,@channelB,-1001234567890
-  #      GROUP_TARGET=@mychannelA,@mychannelB,@mychannelC
+  # OPTION A — GROUP_MIRROR_PAIRS: fully flexible, mix any combination of
+  # one-to-one, many-to-one, and one-to-many in a single line.
+  # Format: source>target, comma-separated between pairs.
+  #   GROUP_MIRROR_PAIRS=@channelA>@aggregator,@channelB>@aggregator,@channelC>@channelCtarget,@channelD>@target1,@channelD>@target2
+  # Here: A and B both feed into the shared @aggregator, C has its own
+  # separate target, and D fans out to two different targets -- all at once.
   #
-  # 2) Many-to-one: list a SINGLE target and multiple sources -- every
-  #    source automatically mirrors into that one shared target:
-  #      GROUP_SOURCE=@channelA,@channelB,@channelC
-  #      GROUP_TARGET=@myaggregatorchannel
+  # OPTION B — GROUP_SOURCE / GROUP_TARGET: simpler list-based config.
+  #   - Equal-length lists: paired by position (1st-to-1st, 2nd-to-2nd...)
+  #   - Single target, multiple sources: many-to-one for the WHOLE list
+  #   - Single source, multiple targets: one-to-many for the WHOLE list
+  #   GROUP_SOURCE=@channelA,@channelB,-1001234567890
+  #   GROUP_TARGET=@mychannelA,@mychannelB,@mychannelC
   #
-  # 3) One-to-many: list a SINGLE source and multiple targets -- that one
-  #    source mirrors into every listed target:
-  #      GROUP_SOURCE=@channelA
-  #      GROUP_TARGET=@mychannelA,@mychannelB
-  #
-  # Each entry can be a group/channel username or numeric ID.
+  # You can set only one, or both together -- any pairs from GROUP_MIRROR_PAIRS
+  # plus any pairs from GROUP_SOURCE/GROUP_TARGET all run simultaneously.
+  # Each entry (either option) can be a group/channel username or numeric ID.
 """
 
 import os
@@ -88,7 +91,10 @@ FORWARD_ALL_FROM_RAW = [
     x.strip() for x in os.environ.get("FORWARD_ALL_FROM", "").split(",") if x.strip()
 ]
 
-# --- Group mirror config (comma-separated, paired by position) ---
+# --- Group mirror config ---
+# OPTION A (flexible, mixed modes): source>target pairs, comma-separated
+GROUP_MIRROR_PAIRS = os.environ.get("GROUP_MIRROR_PAIRS", "")
+# OPTION B (simple, all-or-nothing mode): used only if GROUP_MIRROR_PAIRS is empty
 GROUP_SOURCE = os.environ.get("GROUP_SOURCE", "")
 GROUP_TARGET = os.environ.get("GROUP_TARGET", "")
 
@@ -426,39 +432,27 @@ async def resolve_forward_all_from():
 
 async def resolve_group_mirrors():
     """
-    Resolves GROUP_SOURCE / GROUP_TARGET into `mirror_pairs`.
+    Resolves group mirror config into `mirror_pairs`. BOTH config styles can
+    be used at once -- their results are merged, not one overriding the
+    other:
 
-    - Equal-length lists: paired by position (1st source -> 1st target, etc.)
-    - Single target, multiple sources: many-to-one -- every source mirrors
-      into that one shared target.
-    - Single source, multiple targets: one-to-many -- that source mirrors
-      into every listed target.
+    - GROUP_MIRROR_PAIRS: source>target pairs, comma-separated. Supports any
+      mix of one-to-one, many-to-one, and one-to-many, since each pair is
+      independent.
+    - GROUP_SOURCE / GROUP_TARGET: simpler list-based config --
+        - Equal-length lists: paired by position (1st source -> 1st target)
+        - Single target, multiple sources: many-to-one for the whole list
+        - Single source, multiple targets: one-to-many for the whole list
+
+    Any pairs from both are added together into the same mirror_pairs list.
 
     Each pair's source_id is the normalized 'marked' peer id so it can be
     compared directly against event.chat_id.
     """
     global mirror_pairs
-    sources = [s.strip() for s in GROUP_SOURCE.split(",") if s.strip()]
-    targets = [t.strip() for t in GROUP_TARGET.split(",") if t.strip()]
 
-    if not sources or not targets:
-        print("[mirror] GROUP_SOURCE or GROUP_TARGET not set — mirror disabled.")
-        return
-
-    if len(targets) == 1 and len(sources) > 1:
-        print(f"[mirror] Many-to-one mode: all {len(sources)} sources will mirror into '{targets[0]}'.")
-        targets = targets * len(sources)
-    elif len(sources) == 1 and len(targets) > 1:
-        print(f"[mirror] One-to-many mode: '{sources[0]}' will mirror into all {len(targets)} targets.")
-        sources = sources * len(targets)
-    elif len(sources) != len(targets):
-        print(
-            f"[mirror] ⚠️ GROUP_SOURCE has {len(sources)} entries but GROUP_TARGET has "
-            f"{len(targets)}. Pairing by position up to the shorter list; extra entries ignored."
-        )
-
-    # Cache resolved entities so the same source/target isn't re-resolved
-    # repeatedly in many-to-one / one-to-many setups.
+    # Cache resolved entities across BOTH config styles so a repeated
+    # source/target isn't re-resolved every time.
     resolved_cache = {}
 
     async def resolve_cached(value):
@@ -466,19 +460,18 @@ async def resolve_group_mirrors():
             resolved_cache[value] = await resolve_any_chat(value)
         return resolved_cache[value]
 
-    for src_val, tgt_val in zip(sources, targets):
+    async def add_pair(src_val, tgt_val):
         try:
             source_entity = await resolve_cached(src_val)
             source_id = utils.get_peer_id(source_entity)
         except Exception as e:
             print(f"[mirror] ❌ Could not resolve source '{src_val}': {e}")
-            continue
-
+            return
         try:
             target_entity = await resolve_cached(tgt_val)
         except Exception as e:
             print(f"[mirror] ❌ Could not resolve target '{tgt_val}': {e}")
-            continue
+            return
 
         mirror_pairs.append({
             "source_id": source_id,
@@ -490,8 +483,39 @@ async def resolve_group_mirrors():
             f"{getattr(target_entity, 'title', tgt_val)} (chat_id {source_id})"
         )
 
+    # --- GROUP_MIRROR_PAIRS (if set) ---
+    if GROUP_MIRROR_PAIRS.strip():
+        raw_pairs = [p.strip() for p in GROUP_MIRROR_PAIRS.split(",") if p.strip()]
+        print(f"[mirror] GROUP_MIRROR_PAIRS: {len(raw_pairs)} pair(s) configured.")
+        for raw in raw_pairs:
+            if ">" not in raw:
+                print(f"[mirror] ❌ Malformed pair '{raw}' — expected format source>target, skipping.")
+                continue
+            src_val, tgt_val = (part.strip() for part in raw.split(">", 1))
+            await add_pair(src_val, tgt_val)
+
+    # --- GROUP_SOURCE / GROUP_TARGET (if set) -- merged in alongside the above ---
+    sources = [s.strip() for s in GROUP_SOURCE.split(",") if s.strip()]
+    targets = [t.strip() for t in GROUP_TARGET.split(",") if t.strip()]
+
+    if sources and targets:
+        if len(targets) == 1 and len(sources) > 1:
+            print(f"[mirror] GROUP_SOURCE/TARGET many-to-one: all {len(sources)} sources -> '{targets[0]}'.")
+            targets = targets * len(sources)
+        elif len(sources) == 1 and len(targets) > 1:
+            print(f"[mirror] GROUP_SOURCE/TARGET one-to-many: '{sources[0]}' -> all {len(targets)} targets.")
+            sources = sources * len(targets)
+        elif len(sources) != len(targets):
+            print(
+                f"[mirror] ⚠️ GROUP_SOURCE has {len(sources)} entries but GROUP_TARGET has "
+                f"{len(targets)}. Pairing by position up to the shorter list; extra entries ignored."
+            )
+
+        for src_val, tgt_val in zip(sources, targets):
+            await add_pair(src_val, tgt_val)
+
     if not mirror_pairs:
-        print("[mirror] No valid mirror pairs configured.")
+        print("[mirror] No valid mirror pairs configured (GROUP_MIRROR_PAIRS and GROUP_SOURCE/GROUP_TARGET both empty or invalid).")
 
 
 # --- Handlers ---
