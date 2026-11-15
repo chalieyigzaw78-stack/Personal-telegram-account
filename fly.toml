@@ -1,8 +1,5 @@
-[app]
-name = "personal-telegram-account"
+app = "personal-telegram-account"
 primary_region = "fra"
-
-[build]
 
 [http_service]
   internal_port = 10000
